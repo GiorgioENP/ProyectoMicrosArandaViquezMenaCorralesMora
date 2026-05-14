@@ -35,3 +35,6 @@ desktop.ini
 firmware_esp32/*.elf
 firmware_esp32/*.hex
 firmware_esp32/build/
+
+# PDFs (documentación local, no versionar)
+*.pdf
