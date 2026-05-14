@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Estado del sistema (generado en tiempo de ejecución, no versionar el de pruebas)
+# Descomenta la siguiente línea si no quieres versionar el estado:
+# estado.txt
+
+# Entornos virtuales
+venv/
+env/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Arduino
+firmware_esp32/*.elf
+firmware_esp32/*.hex
+firmware_esp32/build/

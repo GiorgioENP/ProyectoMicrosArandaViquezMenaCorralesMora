@@ -1,0 +1,47 @@
+# Estado del Sistema de Percheros Inteligentes
+# Generado automáticamente; editar a mano puede dañar el formato.
+
+[meta]
+proximo_id=16
+
+[prendas]
+# id|nombre|tipo|color|tela|talla|fit
+2|jean-negro|Pantalón|Negro|Denim|L|Slim
+3|short-blanco|Short|Blanco|Algodón|S|Loose
+4|relleno3-0|T-Shirt|Gris|Polyester|S|Regular
+5|relleno3-1|T-Shirt|Gris|Polyester|S|Regular
+6|relleno3-2|T-Shirt|Gris|Polyester|S|Regular
+7|relleno3-3|T-Shirt|Gris|Polyester|S|Regular
+8|relleno3-4|T-Shirt|Gris|Polyester|S|Regular
+9|relleno1-0|T-Shirt|Gris|Polyester|S|Regular
+10|relleno1-1|T-Shirt|Gris|Polyester|S|Regular
+11|relleno1-2|T-Shirt|Gris|Polyester|S|Regular
+12|relleno2-3|T-Shirt|Gris|Polyester|S|Regular
+13|relleno2-4|T-Shirt|Gris|Polyester|S|Regular
+14|relleno2-5|T-Shirt|Gris|Polyester|S|Regular
+15|relleno2-6|T-Shirt|Gris|Polyester|S|Regular
+
+[perchero_1]
+# slot_idx|prenda_id   (vacío si slot vacío)
+0|
+1|
+2|9
+3|10
+4|11
+
+[perchero_2]
+# slot_idx|prenda_id   (vacío si slot vacío)
+0|
+1|12
+2|13
+3|14
+4|15
+
+[perchero_3]
+# slot_idx|prenda_id   (vacío si slot vacío)
+0|4
+1|5
+2|6
+3|7
+4|8
+
