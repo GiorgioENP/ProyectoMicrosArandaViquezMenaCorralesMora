@@ -2,7 +2,7 @@
 # Generado automáticamente; editar a mano puede dañar el formato.
 
 [meta]
-proximo_id=16
+proximo_id=19
 
 [prendas]
 # id|nombre|tipo|color|tela|talla|fit
@@ -16,30 +16,36 @@ proximo_id=16
 9|relleno1-0|T-Shirt|Gris|Polyester|S|Regular
 10|relleno1-1|T-Shirt|Gris|Polyester|S|Regular
 11|relleno1-2|T-Shirt|Gris|Polyester|S|Regular
-12|relleno2-3|T-Shirt|Gris|Polyester|S|Regular
-13|relleno2-4|T-Shirt|Gris|Polyester|S|Regular
-14|relleno2-5|T-Shirt|Gris|Polyester|S|Regular
-15|relleno2-6|T-Shirt|Gris|Polyester|S|Regular
+12|relleno1-3|T-Shirt|Gris|Polyester|S|Regular
+13|relleno1-4|T-Shirt|Gris|Polyester|S|Regular
+14|relleno2-0|T-Shirt|Gris|Polyester|S|Regular
+15|relleno2-1|T-Shirt|Gris|Polyester|S|Regular
+16|relleno2-2|T-Shirt|Gris|Polyester|S|Regular
+17|relleno2-3|T-Shirt|Gris|Polyester|S|Regular
+18|relleno2-4|T-Shirt|Gris|Polyester|S|Regular
+19|a|T-Shirt|Blanco|Denim|S|Regular
+20|b|Pantalón|Blanco|Denim|S|Regular
+21|c|Short|Blanco|Denim|S|Skinny
 
 [perchero_1]
 # slot_idx|prenda_id   (vacío si slot vacío)
-0|
-1|
-2|9
-3|10
-4|11
+0|9
+1|10
+2|
+3|
+4|
 
 [perchero_2]
 # slot_idx|prenda_id   (vacío si slot vacío)
-0|
-1|12
-2|13
-3|14
-4|15
+0|14
+1|
+2|
+3|
+4|
 
 [perchero_3]
 # slot_idx|prenda_id   (vacío si slot vacío)
-0|4
+0|
 1|5
 2|6
 3|7

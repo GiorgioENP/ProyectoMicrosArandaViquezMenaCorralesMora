@@ -4,15 +4,14 @@ main.py — Punto de entrada de la aplicación de Percheros Inteligentes.
 Arranca:
   1. Configura DISPLAY si corre en Raspberry Pi sin variable de entorno.
   2. La base de datos (Sistema) y carga estado previo si existe.
-  3. El driver UART al ESP32 (mock automático si no hay hardware).
+  3. El driver I2C al ESP32 (mock automático si no hay hardware).
   4. La interfaz Tkinter con los 4 botones (GPIO en Pi, teclado/click
      simulado en Windows).
   5. El mainloop hasta que el usuario salga.
 
 Uso:
-    python3 main.py                  # autodetecta puerto UART; cae a mock si falta.
-    python3 main.py --mock           # fuerza el modo mock (no toca el UART).
-    python3 main.py --puerto COM3    # especifica un puerto serial concreto.
+    python3 main.py        # I2C real si está disponible; cae a mock si no.
+    python3 main.py --mock # fuerza el modo mock (no toca el bus I2C).
 
 Raspberry Pi + HDMI:
     La GUI se pone automáticamente en fullscreen en el monitor HDMI conectado.
@@ -39,18 +38,11 @@ from interfaz import Interfaz
 
 def parsear_args(argv: list[str]):
     forzar_mock = "--mock" in argv
-    puerto = None
-    if "--puerto" in argv:
-        try:
-            puerto = argv[argv.index("--puerto") + 1]
-        except IndexError:
-            print("ERROR: --puerto requiere un valor (ej: --puerto /dev/serial0)")
-            sys.exit(1)
-    return puerto, forzar_mock
+    return forzar_mock
 
 
 def main():
-    puerto, forzar_mock = parsear_args(sys.argv[1:])
+    forzar_mock = parsear_args(sys.argv[1:])
 
     print("═" * 55)
     print("  Sistema de Percheros Inteligentes — Arranque")
@@ -64,14 +56,11 @@ def main():
     else:
         print(f"ℹ  Sin estado previo ('{ARCHIVO_ESTADO}' no existe). Comenzando vacío.")
 
-    # 2) Driver al ESP32 (UART real si está, mock si no)
-    driver = ESP32Driver(puerto=puerto, forzar_mock=forzar_mock)
+    # 2) Driver al ESP32 (I2C real si está, mock si no)
+    driver = ESP32Driver(forzar_mock=forzar_mock)
 
     rping = driver.ping()
     print(("✓ " if rping.ok else "✗ ") + f"PING ESP32: {rping.mensaje}")
-
-    rhome = driver.home()
-    print(("✓ " if rhome.ok else "✗ ") + f"HOME ESP32: {rhome.mensaje}")
 
     print("─" * 55)
     print("  Iniciando interfaz gráfica...")
@@ -86,7 +75,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # Persistir estado y cerrar UART
+        # guardar estado; el HOME_STEPPER lo envía interfaz._cerrar()
         r = sistema.guardar_estado(ARCHIVO_ESTADO)
         print(("✓ " if r.ok else "✗ ") + r.mensaje)
         driver.cerrar()
