@@ -1,17 +1,21 @@
 """
-entrada.py — Abstracción de los 4 botones físicos.
+entrada.py — Abstracción de los controles físicos.
 
-En Raspberry Pi escucha los GPIO con interrupciones (cumple requerimiento
-del PDF: 'El uso de interrupciones para el microcontrolador es de carácter
-obligatorio'... el mismo principio aplica aquí del lado del microprocesador
-para los botones de la interfaz).
+Controles físicos en Raspberry Pi 5:
+  · Encoder EC11  A=GPIO17, B=GPIO27  → Boton.SIGUIENTE / Boton.ANTERIOR
+  · Botón SEL     GPIO22              → Boton.SI   (seleccionar / confirmar)
+  · Botón BACK    GPIO4               → Boton.NO   (atrás / cancelar)
+  · Botón ABORT   GPIO10              → Boton.ABORT (abortar al menú principal)
 
-En Windows / desarrollo, los mismos eventos se disparan desde:
-  · Teclas físicas: Flecha-izq=Anterior, Flecha-der=Siguiente, Enter=Sí, Esc=No.
-  · Botones clickeables que el módulo `interfaz` agrega abajo de la GUI.
+En Windows / desarrollo los mismos eventos se disparan con:
+  · Flecha-izq  → Boton.ANTERIOR
+  · Flecha-der  → Boton.SIGUIENTE
+  · Enter       → Boton.SI
+  · Delete      → Boton.NO   (atrás)
+  · Space       → Boton.ABORT
 
-Sea cual sea la fuente, todo termina llamando al mismo callback registrado
-con `Entrada.on(boton, callback)`.
+Uso de lgpio (único backend compatible con el chip GPIO RP1 del Pi 5;
+RPi.GPIO no soporta el Pi 5).
 """
 
 from __future__ import annotations
@@ -25,10 +29,8 @@ from typing import Callable, Optional
 # ─────────────────────────────────────────
 
 def _es_raspberry_pi() -> bool:
-    """Detecta si estamos corriendo en una Raspberry Pi."""
     if platform.system() != "Linux":
         return False
-    # /proc/device-tree/model existe en RPi y dice "Raspberry Pi …"
     try:
         with open("/proc/device-tree/model", "r") as f:
             return "raspberry pi" in f.read().lower()
@@ -42,16 +44,14 @@ ES_RASPBERRY = _es_raspberry_pi()
 # ─────────────────────────────────────────
 # Pinout (BCM)
 # ─────────────────────────────────────────
-# Estos números los puedes cambiar según tu cableado físico.
-# Los elegí de pines GPIO seguros (ni I2C, ni SPI, ni UART)
-# para que el bus de comunicación con el ESP32 quede libre.
 
-PIN_SI         = 17   # Pin físico 11
-PIN_NO         = 27   # Pin físico 13
-PIN_SIGUIENTE  = 22   # Pin físico 15
-PIN_ANTERIOR   = 23   # Pin físico 16
+PIN_ENC_A = 17   # Encoder EC11 fase A  (pin físico 11)
+PIN_ENC_B = 27   # Encoder EC11 fase B  (pin físico 13)
+PIN_SEL   = 22   # Botón SELECCIONAR    (pin físico 15)
+PIN_BACK  = 4    # Botón ATRÁS          (pin físico 7)
+PIN_ABORT = 10   # Botón ABORT          (pin físico 19)
 
-DEBOUNCE_MS = 200     # antirrebote
+DEBOUNCE_MS = 200
 
 
 # ─────────────────────────────────────────
@@ -59,10 +59,11 @@ DEBOUNCE_MS = 200     # antirrebote
 # ─────────────────────────────────────────
 
 class Boton(Enum):
-    SI        = "si"
-    NO        = "no"
-    SIGUIENTE = "siguiente"
-    ANTERIOR  = "anterior"
+    SI       = "si"        # SEL: seleccionar / confirmar
+    NO       = "no"        # BACK: un paso atrás
+    SIGUIENTE = "siguiente" # Encoder CW
+    ANTERIOR  = "anterior"  # Encoder CCW
+    ABORT    = "abort"     # ABORT: volver al menú principal desde cualquier lugar
 
 
 # ─────────────────────────────────────────
@@ -70,21 +71,22 @@ class Boton(Enum):
 # ─────────────────────────────────────────
 
 class Entrada:
-    """Maneja los 4 botones (físicos en Pi, simulados en Windows).
+    """Maneja encoder EC11 + 3 botones (físicos en Pi, teclado/click en PC).
 
     Uso:
         entrada = Entrada()
-        entrada.on(Boton.SI, mi_funcion)
+        entrada.on(Boton.SI,    seleccionar)
+        entrada.on(Boton.ABORT, abortar)
         ...
-        entrada.cleanup()  # al cerrar la aplicación
+        entrada.cleanup()
     """
 
     def __init__(self, tk_root=None):
-        """tk_root: la ventana de Tkinter; si se pasa, se enlazan
-        las teclas (flechas, Enter, Esc) como atajos."""
         self._callbacks: dict[Boton, Callable[[], None]] = {}
-        self._tk_root = tk_root
-        self._gpio = None  # módulo RPi.GPIO si está disponible
+        self._tk_root   = tk_root
+        self._gpio      = None
+        self._enc_last  = 0
+        self._enc_raw   = 0
 
         if ES_RASPBERRY:
             self._init_gpio()
@@ -94,62 +96,91 @@ class Entrada:
     # ─── API pública ─────────────────────
 
     def on(self, boton: Boton, callback: Callable[[], None]) -> None:
-        """Registra el callback que se ejecuta al presionar `boton`.
-
-        Sobrescribe el callback anterior si lo había. La interfaz
-        usa esto para reconfigurar los botones cuando cambia de pantalla.
-        """
         self._callbacks[boton] = callback
 
     def disparar(self, boton: Boton) -> None:
-        """Llama manualmente al callback de un botón. Lo usan los
-        botones clickeables de la GUI en Windows."""
         cb = self._callbacks.get(boton)
         if cb is not None:
-            # Si estamos dentro de una interrupción GPIO, hay que volver
-            # al hilo principal de Tkinter. Si no hay tk_root, llamamos directo.
             if self._tk_root is not None:
                 self._tk_root.after(0, cb)
             else:
                 cb()
 
     def cleanup(self) -> None:
-        """Libera los GPIO. Llamar al cerrar la aplicación."""
         if self._gpio is not None:
-            self._gpio.cleanup()
+            try:
+                self._gpio.gpiochip_close(self._chip)
+            except Exception:
+                pass
 
-    # ─── inicialización plataforma-específica ──
+    # ─── inicialización GPIO ──────────────
 
     def _init_gpio(self) -> None:
-        """Configura los GPIO de la Pi con interrupciones (FALLING edge)."""
         try:
-            import RPi.GPIO as GPIO  # type: ignore
+            import lgpio  # type: ignore
         except ImportError:
-            print("⚠ RPi.GPIO no disponible, GPIO deshabilitado.")
+            print("⚠ lgpio no disponible.")
+            print("  pip install lgpio --break-system-packages")
             return
 
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
+        chip = lgpio.gpiochip_open(0)
+        self._chip = chip
+        self._gpio = lgpio
 
+        # Encoder EC11
+        lgpio.gpio_claim_input(chip, PIN_ENC_A, lgpio.SET_PULL_UP)
+        lgpio.gpio_claim_input(chip, PIN_ENC_B, lgpio.SET_PULL_UP)
+
+        a = lgpio.gpio_read(chip, PIN_ENC_A)
+        b = lgpio.gpio_read(chip, PIN_ENC_B)
+        self._enc_last = (a << 1) | b
+
+        lgpio.gpio_claim_alert(chip, PIN_ENC_A, lgpio.BOTH_EDGES)
+        lgpio.gpio_claim_alert(chip, PIN_ENC_B, lgpio.BOTH_EDGES)
+        self._cb_enc_a = lgpio.callback(chip, PIN_ENC_A, lgpio.BOTH_EDGES,
+                                        self._isr_encoder)
+        self._cb_enc_b = lgpio.callback(chip, PIN_ENC_B, lgpio.BOTH_EDGES,
+                                        self._isr_encoder)
+
+        # Botones (flanco descendente = LOW al presionar)
         for pin, boton in [
-            (PIN_SI,         Boton.SI),
-            (PIN_NO,         Boton.NO),
-            (PIN_SIGUIENTE,  Boton.SIGUIENTE),
-            (PIN_ANTERIOR,   Boton.ANTERIOR),
+            (PIN_SEL,   Boton.SI),
+            (PIN_BACK,  Boton.NO),
+            (PIN_ABORT, Boton.ABORT),
         ]:
-            # Pull-up interno: el botón conecta a GND al presionarse,
-            # por eso detectamos flanco descendente (FALLING).
-            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.add_event_detect(
-                pin, GPIO.FALLING,
-                callback=lambda _ch, b=boton: self.disparar(b),
-                bouncetime=DEBOUNCE_MS,
-            )
-        self._gpio = GPIO
+            lgpio.gpio_claim_input(chip, pin, lgpio.SET_PULL_UP)
+            lgpio.gpio_claim_alert(chip, pin, lgpio.FALLING_EDGE)
+            lgpio.callback(chip, pin, lgpio.FALLING_EDGE,
+                           lambda _c, _g, _l, _t, b=boton: self.disparar(b))
+
+    _ENC_CW  = {0b1101, 0b0100, 0b0010, 0b1011}
+    _ENC_CCW = {0b1110, 0b0111, 0b0001, 0b1000}
+
+    def _isr_encoder(self, chip, gpio, level, tick):
+        lgpio = self._gpio
+        a = lgpio.gpio_read(self._chip, PIN_ENC_A)
+        b = lgpio.gpio_read(self._chip, PIN_ENC_B)
+        encoded = (a << 1) | b
+        total   = (self._enc_last << 2) | encoded
+
+        if total in self._ENC_CW:
+            self._enc_raw += 1
+        elif total in self._ENC_CCW:
+            self._enc_raw -= 1
+
+        self._enc_last = encoded
+
+        steps = self._enc_raw // 4
+        if steps != 0:
+            self._enc_raw -= steps * 4
+            if steps > 0:
+                self.disparar(Boton.SIGUIENTE)
+            else:
+                self.disparar(Boton.ANTERIOR)
 
     def _init_keyboard(self, root) -> None:
-        """Mapea teclas a botones para desarrollo en Windows."""
         root.bind("<Left>",   lambda _e: self.disparar(Boton.ANTERIOR))
         root.bind("<Right>",  lambda _e: self.disparar(Boton.SIGUIENTE))
         root.bind("<Return>", lambda _e: self.disparar(Boton.SI))
-        root.bind("<Escape>", lambda _e: self.disparar(Boton.NO))
+        root.bind("<Delete>", lambda _e: self.disparar(Boton.NO))
+        root.bind("<space>",  lambda _e: self.disparar(Boton.ABORT))
