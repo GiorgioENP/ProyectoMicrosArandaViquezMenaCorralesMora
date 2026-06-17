@@ -1,186 +1,214 @@
 /*
  * firmware_esp32.ino — Firmware del ESP32 para el Sistema de Percheros Inteligentes
  *
- * Hardware controlado por este microcontrolador:
- *   1) Motor a pasos (driver tipo A4988 / DRV8825) que rota la base
- *      del set para presentar uno de los 3 percheros al usuario.
- *   2) Tres servomotores (uno por perchero), cada uno con 5 posiciones
- *      angulares para presentar la prenda solicitada.
+ * ── Arquitectura de comunicación I2C ────────────────────────────────────────
  *
- * Comunicación:
- *   UART2 (RX2=GPIO16, TX2=GPIO17) a 115200 baud, 8N1.
- *   Recibe comandos en texto plano de la Raspberry Pi y responde con
- *   "OK", "BUSY" o "ERR <razón>".
+ * El driver I2C del ESP-IDF (modo slave) ya registra internamente un ISR de
+ * hardware que transfiere cada byte recibido a un ring buffer circular en RAM.
+ * Ese ISR no es accesible directamente desde Arduino/IDF sin reescribir el
+ * driver completo.
  *
- * Cumple los requerimientos del PDF:
- *   - Microcontrolador NO Arduino (es ESP32). ✓
- *   - Comunicación con Pi por RS-232/UART. ✓
- *   - USO DE INTERRUPCIONES (obligatorio): se usa una interrupción de
- *     timer hardware (timerAttachInterrupt) para generar los pulsos
- *     STEP del motor a pasos sin bloquear el loop principal. ✓
- *   - El microcontrolador gobierna sensores y actuadores. ✓
+ * Lo que SÍ se puede y tiene sentido hacer es eliminar el polling del loop()
+ * principal reemplazándolo por:
  *
- * Librerías necesarias (Arduino IDE):
- *   - ESP32Servo  (Kevin Harrington / John K. Bennett)
+ *   1. Un ISR de GPIO sobre la línea SDA (flanco de START de I2C) que notifica
+ *      a una tarea FreeRTOS vía una cola (Queue) sin despertar el CPU para nada
+ *      hasta que llegue tráfico real.
  *
- * Conexiones:
- *   STEP   → GPIO 14   (paso del stepper)
- *   DIR    → GPIO 27   (dirección del stepper)
- *   ENABLE → GPIO 26   (active LOW)
- *   SERVO1 → GPIO 18
- *   SERVO2 → GPIO 19
- *   SERVO3 → GPIO 21
- *   UART2 RX → GPIO 16   (al TX del Pi, GPIO14)
- *   UART2 TX → GPIO 17   (al RX del Pi, GPIO15)
- *   GND común con Pi y con la fuente de los motores.
+ *   2. Una tarea FreeRTOS dedicada (tareaI2C) que duerme bloqueada en
+ *      xQueueReceive() y solo despierta cuando el ISR deposita una notificación.
+ *      Al despertar, drena el ring buffer del driver I2C, ensambla el comando
+ *      y lo encola en cmdQueue para que lo ejecute la tarea de motores.
+ *
+ *   3. Una tarea FreeRTOS de motores (tareaMotores) que duerme bloqueada en
+ *      xQueueReceive(cmdQueue) y ejecuta los movimientos solo cuando llega
+ *      un comando. Envía la respuesta OK/ERR por I2C al terminar.
+ *
+ * Con este esquema el CPU queda en idle (WFI) entre comandos; solo lo
+ * despiertan eventos reales de hardware (flanco SDA), no un contador de 10 ms.
+ *
+ * ── Pines ───────────────────────────────────────────────────────────────────
+ *   ULN2003  IN1 → GPIO 14
+ *            IN2 → GPIO 27
+ *            IN3 → GPIO 26
+ *            IN4 → GPIO 25
+ *   SERVO1   → GPIO 18   (MiniDisco 1)
+ *   SERVO2   → GPIO 19   (MiniDisco 2)
+ *   SERVO3   → GPIO 23   (MiniDisco 3)
+ *   SDA      → GPIO 21
+ *   SCL      → GPIO 22
+ *
+ * ── Protocolo Pi → ESP32 (texto plano, terminado en '\n') ───────────────────
+ *   PING          — verificar comunicación
+ *   GOTO <n>      — ir al estado n (1–15): mueve stepper + servo
+ *   RETIRAR       — confirmación del usuario (sin movimiento de motor)
+ *   HOME_STEPPER  — fin de sesión: servos a 0° + stepper al disco 0
+ *   STATUS        — responde con estado actual
+ *
+ * ── Protocolo ESP32 → Pi ────────────────────────────────────────────────────
+ *   OK
+ *   ERR <razón>
+ *   STATUS <estado> <disco+1> <posServo+1>
  */
 
+#include <Arduino.h>
 #include <ESP32Servo.h>
+#include <Stepper.h>
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 
 // ─────────────────────────────────────────
-// Configuración
+// Pines
 // ─────────────────────────────────────────
 
-#define STEP_PIN     14
-#define DIR_PIN      27
-#define ENABLE_PIN   26
-#define SERVO1_PIN   18
-#define SERVO2_PIN   19
-#define SERVO3_PIN   21
+#define IN1        14
+#define IN2        27
+#define IN3        26
+#define IN4        25
 
-#define UART_BAUD    115200
-#define UART_RX      16
-#define UART_TX      17
+#define SERVO1_PIN 18
+#define SERVO2_PIN 19
+#define SERVO3_PIN 23
 
-// Stepper: 1.8°/paso × microstepping 1/8 = 0.225°/paso
-// Una revolución completa = 1600 pasos (microstepped)
-// 360° / 3 percheros = 120° por perchero = 533 pasos
-const int PASOS_POR_REV       = 1600;
-const int PASOS_POR_PERCHERO  = PASOS_POR_REV / 3;
-
-// Servos: 5 posiciones de 18° a 162° en pasos de 36°
-const int ANG_BASE = 18;
-const int ANG_PASO = 36;
-
-// Frecuencia del timer para los pulsos STEP.
-// Velocidad del motor: 800 Hz → 800 pasos/s → 0.5 rev/s
-// Período del timer = 1/(2*800) = 625 µs (cambia el pin cada medio período)
-const int STEP_HALF_PERIOD_US = 625;
+#define I2C_SLAVE_ADDR  0x08
+#define SDA_PIN         21
+#define SCL_PIN         22
+#define I2C_PORT        I2C_NUM_0
+#define I2C_RX_BUF_LEN 256   // más grande para absorber ráfagas sin pérdida
+#define I2C_TX_BUF_LEN 128
 
 // ─────────────────────────────────────────
-// Estado global (compartido con la ISR)
+// Motores
 // ─────────────────────────────────────────
 
-Servo servo[3];
-volatile int  pasos_pendientes = 0;   // pasos restantes por dar
-volatile bool nivel_step       = false;
+const int stepsPerRevolution = 2048;
+const int steps120           = stepsPerRevolution / 3;
 
-hw_timer_t* timer_step = nullptr;
-portMUX_TYPE timer_mux = portMUX_INITIALIZER_UNLOCKED;
+Stepper stepperMotor(stepsPerRevolution, IN1, IN3, IN2, IN4);
 
-int  perchero_actual = 1;             // 1..3, posición frontal de la base
-int  servo_pos[3]    = {0, 0, 0};     // 0..4, posición actual de cada servo
+Servo servo1;
+Servo servo2;
+Servo servo3;
+
+int servoAngles[5] = {0, 45, 90, 135, 180};
 
 // ─────────────────────────────────────────
-// ISR del timer (genera los pulsos STEP)
+// Estado global (solo accedido desde tareaMotores)
+// ─────────────────────────────────────────
+
+static int currentDisk     = 0;
+static int currentServoPos = 0;
+static int currentState    = 1;
+
+// ─────────────────────────────────────────
+// Colas FreeRTOS
+// ─────────────────────────────────────────
+
+// ISR → tareaI2C: notificación de actividad en bus (valor ignorado)
+static QueueHandle_t sdaQueue;
+
+// tareaI2C → tareaMotores: comando completo como string fijo
+#define CMD_MAX_LEN 32
+typedef struct { char cmd[CMD_MAX_LEN]; } CmdMsg;
+static QueueHandle_t cmdQueue;
+
+// ─────────────────────────────────────────
+// ISR de GPIO — flanco de START en SDA
 // ─────────────────────────────────────────
 //
-// Esta función se ejecuta cada STEP_HALF_PERIOD_US microsegundos.
-// Cumple el requerimiento "uso de interrupciones obligatorio" del PDF:
-// el motor avanza sin que el loop principal tenga que ocuparse de
-// generar los pulsos.
+// El master I2C (Raspberry Pi) baja SDA mientras SCL está alto para
+// señalizar una condición de START. Ese flanco descendente en SDA es
+// la señal más temprana posible de que va a llegar un comando.
+//
+// El ISR no lee datos; solo deposita un token en sdaQueue para
+// despertar la tareaI2C. xQueueSendFromISR no bloquea y es segura
+// desde contexto de interrupción.
+//
+// IRAM_ATTR: el ISR debe residir en RAM interna para ejecutarse
+// incluso cuando el caché de flash está ocupado.
 
-void IRAM_ATTR onStepTimer() {
-  portENTER_CRITICAL_ISR(&timer_mux);
-  if (pasos_pendientes > 0) {
-    nivel_step = !nivel_step;
-    digitalWrite(STEP_PIN, nivel_step ? HIGH : LOW);
-    // un "paso" completo es flanco de subida + flanco de bajada
-    if (!nivel_step) {
-      pasos_pendientes--;
-    }
-  }
-  portEXIT_CRITICAL_ISR(&timer_mux);
+static void IRAM_ATTR isrSDA(void* arg) {
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+  uint8_t token = 1;
+  xQueueSendFromISR(sdaQueue, &token, &xHigherPriorityTaskWoken);
+  // Si despertar la tarea requiere un cambio de contexto inmediato,
+  // portYIELD_FROM_ISR lo solicita al scheduler antes de salir del ISR.
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 // ─────────────────────────────────────────
-// Movimiento del stepper
+// Helpers de respuesta
 // ─────────────────────────────────────────
 
-bool stepper_ocupado() {
-  bool ocupado;
-  portENTER_CRITICAL(&timer_mux);
-  ocupado = (pasos_pendientes > 0);
-  portEXIT_CRITICAL(&timer_mux);
-  return ocupado;
-}
+static char respBuf[I2C_TX_BUF_LEN];
 
-void mover_stepper(int delta_pasos) {
-  // delta_pasos negativo = sentido contrario
-  digitalWrite(DIR_PIN, delta_pasos >= 0 ? HIGH : LOW);
-  digitalWrite(ENABLE_PIN, LOW);  // activa el driver
-  portENTER_CRITICAL(&timer_mux);
-  pasos_pendientes = abs(delta_pasos);
-  portEXIT_CRITICAL(&timer_mux);
-  while (stepper_ocupado()) { delay(1); }   // bloqueamos hasta terminar
-  digitalWrite(ENABLE_PIN, HIGH); // libera (motor sin torque, ahorra energía)
-}
-
-// ─────────────────────────────────────────
-// Comandos de alto nivel
-// ─────────────────────────────────────────
-
-bool ir_a_perchero(int p) {
-  if (p < 1 || p > 3) return false;
-
-  // Calcular delta directo en pasos
-  int delta = (p - perchero_actual) * PASOS_POR_PERCHERO;
-
-  // Tomar SIEMPRE el camino más corto:
-  // Si el arco directo supera la mitad de una revolución, es más rápido
-  // ir en el sentido contrario (ahorra hasta PASOS_POR_PERCHERO pasos).
-  // Ejemplo: perchero 3 → 1 directo = -1066 pasos, al revés = +533 pasos.
-  int mitad_rev = PASOS_POR_REV / 2;
-  if (delta >  mitad_rev) delta -= PASOS_POR_REV;
-  if (delta < -mitad_rev) delta += PASOS_POR_REV;
-
-  if (delta != 0) {
-    mover_stepper(delta);
-  }
-  perchero_actual = p;
-  return true;
-}
-
-bool rotar_servo(int p, int slot) {
-  if (p < 1 || p > 3 || slot < 0 || slot > 4) return false;
-  int angulo = ANG_BASE + slot * ANG_PASO;
-  servo[p - 1].write(angulo);
-  servo_pos[p - 1] = slot;
-  delay(400);  // tiempo aproximado para que el servo llegue
-  return true;
-}
-
-void home_todos() {
-  // Lleva el stepper a perchero 1 y todos los servos al slot 0
-  // (usuarios de producción pondrían un sensor de fin de carrera)
-  ir_a_perchero(1);
-  for (int i = 0; i < 3; i++) {
-    rotar_servo(i + 1, 0);
-  }
-}
-
-// ─────────────────────────────────────────
-// Parser de comandos UART
-// ─────────────────────────────────────────
-
-void responder(const String& msg) {
-  Serial2.print(msg);
-  Serial2.print('\n');
-  Serial.print("→ ");          // eco por USB serial para debug
+static void enviarRespuesta(const char* msg) {
+  int len = snprintf(respBuf, sizeof(respBuf), "%s\n", msg);
+  i2c_slave_write_buffer(I2C_PORT,
+                         (uint8_t*)respBuf,
+                         len,
+                         pdMS_TO_TICKS(20));
+  Serial.print("→ ");
   Serial.println(msg);
 }
 
-void procesar_comando(String cmd) {
+// ─────────────────────────────────────────
+// Lógica de motores
+// ─────────────────────────────────────────
+
+static void printPos() {
+  Serial.printf("Estado: %d | Disco: %d | ServoPos: %d\n",
+                currentState, currentDisk + 1, currentServoPos + 1);
+}
+
+static void moveToDisk(int target) {
+  while (currentDisk != target) {
+    int dir = (target > currentDisk) ? 1 : -1;
+    currentDisk += dir;
+    stepperMotor.step(dir * steps120);
+    delay(400);
+  }
+}
+
+static void moveServo(int disk, int pos) {
+  switch (disk) {
+    case 0: servo1.write(servoAngles[pos]); break;
+    case 1: servo2.write(servoAngles[pos]); break;
+    case 2: servo3.write(servoAngles[pos]); break;
+  }
+  currentServoPos = pos;
+  delay(500);
+}
+
+static void goToState(int state) {
+  int disk = (state - 1) / 5;
+  int pos  = (state - 1) % 5;
+  moveToDisk(disk);
+  moveServo(disk, pos);
+  currentState = state;
+  printPos();
+}
+
+static void homeStepper() {
+  servo1.write(servoAngles[0]);
+  servo2.write(servoAngles[0]);
+  servo3.write(servoAngles[0]);
+  currentServoPos = 0;
+  delay(600);
+  moveToDisk(0);
+  currentState = 1;
+  Serial.println("[HOME_STEPPER] Servos a 0° y stepper en disco 0.");
+}
+
+// ─────────────────────────────────────────
+// Procesador de comandos (llamado desde tareaMotores)
+// ─────────────────────────────────────────
+
+static void procesarComando(const char* rawCmd) {
+  String cmd = String(rawCmd);
   cmd.trim();
   if (cmd.length() == 0) return;
 
@@ -188,103 +216,234 @@ void procesar_comando(String cmd) {
   Serial.println(cmd);
 
   if (cmd == "PING") {
-    responder("OK");
+    enviarRespuesta("OK");
     return;
   }
 
-  if (cmd == "HOME") {
-    home_todos();
-    responder("OK");
+  if (cmd.startsWith("GOTO ")) {
+    int estado = cmd.substring(5).toInt();
+    if (estado >= 1 && estado <= 15) {
+      goToState(estado);
+      enviarRespuesta("OK");
+    } else {
+      enviarRespuesta("ERR estado invalido (1-15)");
+    }
+    return;
+  }
+
+  if (cmd == "RETIRAR") {
+    Serial.println("[RETIRAR] Confirmado. Motores sin cambio.");
+    enviarRespuesta("OK");
+    return;
+  }
+
+  if (cmd == "HOME_STEPPER") {
+    homeStepper();
+    enviarRespuesta("OK");
     return;
   }
 
   if (cmd == "STATUS") {
-    String r = "STATUS " + String(perchero_actual) + " "
-             + String(servo_pos[0]) + " "
-             + String(servo_pos[1]) + " "
-             + String(servo_pos[2]);
-    responder(r);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "STATUS %d %d %d",
+             currentState, currentDisk + 1, currentServoPos + 1);
+    enviarRespuesta(buf);
     return;
   }
 
-  if (cmd.startsWith("MOVE_BASE ")) {
-    int p = cmd.substring(10).toInt();
-    if (ir_a_perchero(p)) responder("OK");
-    else                  responder("ERR perchero invalido");
-    return;
-  }
-
-  if (cmd.startsWith("ROTATE ")) {
-    int sp1 = cmd.indexOf(' ', 7);
-    if (sp1 < 0) { responder("ERR sintaxis"); return; }
-    int p = cmd.substring(7, sp1).toInt();
-    int s = cmd.substring(sp1 + 1).toInt();
-    if (rotar_servo(p, s)) responder("OK");
-    else                   responder("ERR rango");
-    return;
-  }
-
-  if (cmd.startsWith("PRESENT ")) {
-    int sp1 = cmd.indexOf(' ', 8);
-    if (sp1 < 0) { responder("ERR sintaxis"); return; }
-    int p = cmd.substring(8, sp1).toInt();
-    int s = cmd.substring(sp1 + 1).toInt();
-    if (!ir_a_perchero(p))  { responder("ERR perchero invalido"); return; }
-    if (!rotar_servo(p, s)) { responder("ERR slot invalido");     return; }
-    responder("OK");
-    return;
-  }
-
-  responder("ERR comando desconocido: " + cmd);
+  char err[48];
+  snprintf(err, sizeof(err), "ERR cmd desconocido");
+  enviarRespuesta(err);
 }
 
 // ─────────────────────────────────────────
-// setup / loop
+// Tarea FreeRTOS: recepción I2C
+// ─────────────────────────────────────────
+//
+// Duerme bloqueada en xQueueReceive(sdaQueue) esperando la notificación
+// del ISR de SDA. Al despertar, drena el ring buffer del driver I2C
+// byte a byte, ensambla el comando terminado en '\n' y lo encola en
+// cmdQueue para que tareaMotores lo ejecute.
+//
+// No ejecuta ningún movimiento de motor; solo transforma bytes en comandos.
+// Corre en el Core 0 (mismo que el ISR de GPIO por defecto en ESP32).
+
+static void tareaI2C(void* arg) {
+  static char rxBuf[CMD_MAX_LEN];
+  static int  rxIdx = 0;
+
+  uint8_t token;
+  uint8_t b;
+
+  for (;;) {
+    // Dormir hasta que el ISR de SDA notifique actividad
+    // Timeout de 500 ms como red de seguridad ante bytes que llegan
+    // justo antes de que el ISR se registre (condición de arranque)
+    xQueueReceive(sdaQueue, &token, pdMS_TO_TICKS(500));
+
+    // Drenar todo lo que haya en el ring buffer del driver I2C
+    while (i2c_slave_read_buffer(I2C_PORT, &b, 1, pdMS_TO_TICKS(2)) == 1) {
+      char c = (char)b;
+
+      if (c == '\n' || c == '\r') {
+        if (rxIdx > 0) {
+          rxBuf[rxIdx] = '\0';
+          rxIdx = 0;
+
+          // Encolar el comando para tareaMotores
+          CmdMsg msg;
+          strncpy(msg.cmd, rxBuf, CMD_MAX_LEN - 1);
+          msg.cmd[CMD_MAX_LEN - 1] = '\0';
+          // xQueueSend no bloquea si la cola está llena (descarta):
+          // en este sistema la Pi espera el OK antes de enviar otro
+          // comando, así que la cola nunca debería llenarse.
+          xQueueSend(cmdQueue, &msg, 0);
+        }
+      } else {
+        if (rxIdx < CMD_MAX_LEN - 1) {
+          rxBuf[rxIdx++] = c;
+        } else {
+          // Overflow de buffer: descartar y reiniciar
+          rxIdx = 0;
+          Serial.println("[WARN] Buffer I2C overflow, descartando.");
+        }
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────
+// Tarea FreeRTOS: ejecución de motores
+// ─────────────────────────────────────────
+//
+// Duerme bloqueada en xQueueReceive(cmdQueue) hasta que tareaI2C
+// deposite un comando ensamblado. Luego lo ejecuta sin límite de tiempo
+// (los movimientos de motor pueden tomar varios segundos).
+// Corre en el Core 1 para no competir con la recepción I2C en Core 0.
+
+static void tareaMotores(void* arg) {
+  CmdMsg msg;
+  for (;;) {
+    // Bloquear indefinidamente hasta que llegue un comando
+    if (xQueueReceive(cmdQueue, &msg, portMAX_DELAY) == pdTRUE) {
+      procesarComando(msg.cmd);
+    }
+  }
+}
+
+// ─────────────────────────────────────────
+// setup
 // ─────────────────────────────────────────
 
 void setup() {
-  Serial.begin(115200);                         // USB serial (debug)
-  Serial2.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);  // UART al Pi
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n[ESP32] Iniciando — I2C slave con ISR + FreeRTOS");
 
-  pinMode(STEP_PIN,   OUTPUT);
-  pinMode(DIR_PIN,    OUTPUT);
-  pinMode(ENABLE_PIN, OUTPUT);
-  digitalWrite(ENABLE_PIN, HIGH);  // driver desactivado al boot
+  // ── Motores ──────────────────────────────────────────────────────────
+  stepperMotor.setSpeed(10);
 
-  // Servos
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
-  servo[0].attach(SERVO1_PIN);
-  servo[1].attach(SERVO2_PIN);
-  servo[2].attach(SERVO3_PIN);
+  ESP32PWM::allocateTimer(3);
+  servo1.attach(SERVO1_PIN);
+  servo2.attach(SERVO2_PIN);
+  servo3.attach(SERVO3_PIN);
 
-  // Timer hardware para pulsos del stepper (interrupción)
-  // ESP32 tiene 4 timers de 64 bits, divider de 80 → 1 µs por tick
-  timer_step = timerBegin(0, 80, true);
-  timerAttachInterrupt(timer_step, &onStepTimer, true);
-  timerAlarmWrite(timer_step, STEP_HALF_PERIOD_US, true);
-  timerAlarmEnable(timer_step);
+  servo1.write(servoAngles[0]);
+  servo2.write(servoAngles[0]);
+  servo3.write(servoAngles[0]);
+  currentServoPos = 0;
+  delay(1000);
+  Serial.println("Motores inicializados.");
+  printPos();
 
-  Serial.println("\n[ESP32] Firmware iniciado. Esperando comandos...");
-  // Calibración inicial
-  home_todos();
-  Serial.println("[ESP32] HOME completo. Listo.");
+  // ── Driver I2C slave (ESP-IDF) ───────────────────────────────────────
+  i2c_config_t conf = {};
+  conf.mode                = I2C_MODE_SLAVE;
+  conf.sda_io_num          = SDA_PIN;
+  conf.scl_io_num          = SCL_PIN;
+  conf.sda_pullup_en       = GPIO_PULLUP_ENABLE;
+  conf.scl_pullup_en       = GPIO_PULLUP_ENABLE;
+  conf.slave.addr_10bit_en = 0;
+  conf.slave.slave_addr    = I2C_SLAVE_ADDR;
+
+  ESP_ERROR_CHECK(i2c_param_config(I2C_PORT, &conf));
+  ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT,
+                                     I2C_MODE_SLAVE,
+                                     I2C_RX_BUF_LEN,
+                                     I2C_TX_BUF_LEN,
+                                     0));
+  Serial.printf("[I2C] Slave  addr=0x%02X  SDA=GPIO%d  SCL=GPIO%d\n",
+                I2C_SLAVE_ADDR, SDA_PIN, SCL_PIN);
+
+  // ── Colas FreeRTOS ───────────────────────────────────────────────────
+  // sdaQueue: profundidad 4 (absorbe ráfagas de flancos START sin perder)
+  sdaQueue = xQueueCreate(4, sizeof(uint8_t));
+  // cmdQueue: profundidad 2 (la Pi espera OK antes de enviar otro cmd)
+  cmdQueue = xQueueCreate(2, sizeof(CmdMsg));
+
+  // ── ISR de GPIO en SDA ───────────────────────────────────────────────
+  // El driver I2C del ESP-IDF reclama el pin SDA internamente, por lo que
+  // no se puede usar gpio_isr_handler_add() directamente sobre ese pin
+  // sin quitarle el control al driver.
+  //
+  // Solución: instalar el ISR sobre SCL en lugar de SDA.
+  // SCL tiene un flanco descendente al inicio de cada bit transmitido,
+  // por lo que la notificación llega igual de temprano.
+  // El driver I2C sigue gestionando SDA/SCL para la recepción real;
+  // el ISR solo usa SCL como señal de "hay actividad en el bus".
+  //
+  // Configuración:
+  //   - gpio_set_intr_type: NEGEDGE (flanco descendente de SCL = inicio de bit)
+  //   - ESP_INTR_FLAG_IRAM: ISR reside en RAM interna (requerido)
+  //   - ESP_INTR_FLAG_LEVEL1: prioridad baja para no interferir con el
+  //     ISR interno del driver I2C (que corre a prioridad más alta)
+
+  gpio_set_direction((gpio_num_t)SCL_PIN, GPIO_MODE_INPUT);
+  gpio_set_intr_type((gpio_num_t)SCL_PIN, GPIO_INTR_NEGEDGE);
+  gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM);
+  gpio_isr_handler_add((gpio_num_t)SCL_PIN, isrSDA, nullptr);
+  gpio_intr_enable((gpio_num_t)SCL_PIN);
+
+  Serial.println("[ISR] GPIO SCL configurado (NEGEDGE → notifica tareaI2C).");
+
+  // ── Tareas FreeRTOS ───────────────────────────────────────────────────
+  // tareaI2C en Core 0 (mismo core que los ISR de GPIO por defecto)
+  xTaskCreatePinnedToCore(
+    tareaI2C,
+    "tareaI2C",
+    4096,    // stack: suficiente para buffers de recepción
+    nullptr,
+    2,       // prioridad 2: por encima de idle, por debajo de tareaMotores
+    nullptr,
+    0        // Core 0
+  );
+
+  // tareaMotores en Core 1 (libre del scheduler de Wi-Fi/BT si los hubiera)
+  xTaskCreatePinnedToCore(
+    tareaMotores,
+    "tareaMotores",
+    4096,    // stack: suficiente para String + lógica de motores
+    nullptr,
+    3,       // prioridad 3: más alta que tareaI2C para ejecutar sin demora
+    nullptr,
+    1        // Core 1
+  );
+
+  Serial.println("[ESP32] Listo. Esperando comandos vía I2C...");
+  Serial.println("  PING | GOTO <1-15> | RETIRAR | HOME_STEPPER | STATUS");
 }
 
+// ─────────────────────────────────────────
+// loop — vacío
+// ─────────────────────────────────────────
+//
+// Todo el trabajo lo hacen las tareas FreeRTOS y el ISR.
+// El scheduler de FreeRTOS pone el CPU en idle (WFI) cuando no hay
+// ninguna tarea lista para ejecutar, reduciendo el consumo al mínimo.
+
 void loop() {
-  // Lee líneas completas del UART2
-  static String buffer;
-  while (Serial2.available()) {
-    char c = (char)Serial2.read();
-    if (c == '\n' || c == '\r') {
-      if (buffer.length() > 0) {
-        procesar_comando(buffer);
-        buffer = "";
-      }
-    } else {
-      buffer += c;
-      if (buffer.length() > 64) buffer = "";  // protección
-    }
-  }
+  vTaskDelay(portMAX_DELAY);  // ceder el procesador indefinidamente
 }
